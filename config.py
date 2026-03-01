@@ -1,4 +1,4 @@
-PYTHON_CMD = "python"
+PYTHON_CMD = ".venv312/bin/python"
 # For linux and mac, the code python cmd is sometimes 'python3' instead of 'python'
 
 BOT_1_NAME = 'v4'
