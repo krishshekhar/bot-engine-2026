@@ -1,11 +1,11 @@
 PYTHON_CMD = "python"
 # For linux and mac, the code python cmd is sometimes 'python3' instead of 'python'
 
-BOT_1_NAME = 'BotA'
-BOT_1_FILE = './krish/bot6_ver2.py'
+BOT_1_NAME = 'v4'
+BOT_1_FILE = './botharshu_v4.py'
 
-BOT_2_NAME = 'BotB'
-BOT_2_FILE= './krish/bot6.py'
+BOT_2_NAME = 'v3'
+BOT_2_FILE = './botharshu_v3.py'
 
 # GAME PROGRESS IS RECORDED HERE
 GAME_LOG_FOLDER = './logs'
