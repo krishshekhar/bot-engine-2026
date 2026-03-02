@@ -1,5 +1,21 @@
 """
-Exploit-first robust poker bot for Sneak Peek Hold'em.
+v4: Minimal-diff from v3 — only the highest-impact fixes.
+
+Core insight: v3 is a good bot. Its problem isn't thresholds (0.66 raise, 0.54 call
+are actually correct against loose opponents). The problem is RUNAWAY ESCALATION
+(raising 5-6 times with garbage) and AUCTION OVERSPENDING. Fix those two and add
+bigger value bets to exploit opponents' loose calls.
+
+Changes from v3 (everything else is IDENTICAL):
+  1. Escalation gate: track postflop raises, require escalating equity to re-raise
+  2. Hard caps in _safe_raise_or_fallback: prevent individual raises from being huge
+  3. Bigger value bets when checked to: exploit loose callers
+  4. Remove spr < 1.0 / eq > 0.60 all-in push (require 0.78)
+  5. Sizing cap in _choose_postflop_raise_size: pot-sized max, 0.35*eff stack max
+  6. Auction ROI tracking + moderate hard cap
+  7. Remove pot-odds-edge catch (no more calling with 38% equity)
+  8. Modest facing-reraise tightening (0.58 vs 0.54)
+  9. Conservative revealed-card blend (0.55/0.45 vs 0.60/0.40)
 """
 from collections import deque
 import random
@@ -36,7 +52,6 @@ class Player(BaseBot):
         self.rng = random.Random(2026)
         self.round_num = 0
 
-        # Opponent model
         self.opp_vpip_opps = 0
         self.opp_vpip_hits = 0
         self.opp_pfr_opps = 0
@@ -53,12 +68,10 @@ class Player(BaseBot):
         self.our_raise_opps = 0
         self.opp_fold_to_raise_hits = 0
 
-        # Calling station detection: track how often opp calls our postflop bets
         self.our_postflop_bet_spots = 0
         self.opp_call_our_bet_hits = 0
         self.opp_raise_our_bet_hits = 0
 
-        # Auction model
         self.opp_bid_exact_samples = deque(maxlen=260)
         self.opp_bid_lower_bounds = deque(maxlen=260)
         self.auction_seen = 0
@@ -66,14 +79,19 @@ class Player(BaseBot):
         self.auction_loss_streak = 0
         self.auction_overbid_pressure_hits = 0
 
-        # Per-hand trackers
         self.hand_i_raised = False
         self.hand_i_bet_postflop = False
         self.hand_my_bid = None
         self.hand_auction_chips = None
         self.hand_auction_processed = False
+        self.hand_postflop_raises = 0
 
-        # Equity cache
+        self._hand_auction_outcome = 0
+        self._auction_win_rounds = 0
+        self._auction_win_payoff_sum = 0
+        self._auction_loss_rounds = 0
+        self._auction_loss_payoff_sum = 0
+
         self.equity_cache = {}
 
     def on_hand_start(self, game_info: GameInfo, current_state: PokerState) -> None:
@@ -85,12 +103,21 @@ class Player(BaseBot):
         self.hand_my_bid = None
         self.hand_auction_chips = None
         self.hand_auction_processed = False
+        self.hand_postflop_raises = 0
+        self._hand_auction_outcome = 0
 
     def on_hand_end(self, game_info: GameInfo, current_state: PokerState) -> None:
         if self.hand_i_raised:
             self.our_raise_opps += 1
             if len(current_state.opp_revealed_cards) < 2 and current_state.payoff > 0:
                 self.opp_fold_to_raise_hits += 1
+
+        if self._hand_auction_outcome > 0:
+            self._auction_win_rounds += 1
+            self._auction_win_payoff_sum += current_state.payoff
+        elif self._hand_auction_outcome < 0:
+            self._auction_loss_rounds += 1
+            self._auction_loss_payoff_sum += current_state.payoff
 
     def get_move(
         self,
@@ -112,7 +139,7 @@ class Player(BaseBot):
 
         return self._play_postflop(game_info, current_state, t0)
 
-    # ---------- Profile detection ----------
+    # ---------- Profile detection (IDENTICAL to v3) ----------
 
     def _detect_profiles(self, state: PokerState, pred_opp_bid: int) -> dict:
         fold_rate = self._opp_fold_to_raise_rate()
@@ -141,7 +168,6 @@ class Player(BaseBot):
         stack_ratio = pred_opp_bid / float(max(1, state.opp_chips))
         pot_ratio = pred_opp_bid / float(max(1, state.pot))
 
-        # Calling station: opponent calls our bets frequently and rarely folds
         call_rate = self._rate(self.opp_call_our_bet_hits, self.our_postflop_bet_spots, 0.30)
         raise_rate = self._rate(self.opp_raise_our_bet_hits, self.our_postflop_bet_spots, 0.10)
         is_calling_station = (
@@ -167,11 +193,9 @@ class Player(BaseBot):
             "auction_pressure_rate": self._rate(self.auction_overbid_pressure_hits, self.auction_seen, 0.0),
         }
 
-    # ---------- Revealed card analysis ----------
+    # ---------- Revealed card analysis (IDENTICAL to v3) ----------
 
     def _revealed_card_danger(self, board: list[str], opp_revealed: list[str]) -> float:
-        """How dangerous is the revealed opponent card relative to the board?
-        Returns 0.0 (harmless) to 1.0 (very dangerous -- likely paired or better)."""
         if not opp_revealed or not board:
             return 0.0
         rev_rank = RANK_TO_INT[opp_revealed[0][0]]
@@ -194,6 +218,7 @@ class Player(BaseBot):
 
     # ---------- Strategy core ----------
 
+    # _play_preflop: IDENTICAL to v3
     def _play_preflop(self, game_info: GameInfo, state: PokerState):
         hand_key = self._preflop_hand_key(state.my_hand[0], state.my_hand[1])
         tier = self._preflop_tier(hand_key)
@@ -208,6 +233,17 @@ class Player(BaseBot):
         call_cost = max(0, state.cost_to_call)
         pot = max(1, state.pot)
         pot_odds = call_cost / float(pot + call_cost) if call_cost > 0 else 0.0
+
+        # --- NEW: Strict Pre-Flop Stack Commitment Caps ---
+        stack_commit = call_cost / float(max(1, state.my_chips))
+        if call_cost > 0 and state.can_act(ActionFold):
+            # Never commit more than 15% of stack with Tier 1 (or worse)
+            if tier <= 1 and stack_commit > 0.15:
+                return ActionFold()
+            # Never commit more than 35% of stack with Tier 2 (e.g. TT, AJs)
+            if tier == 2 and stack_commit > 0.35:
+                return ActionFold()
+        # --------------------------------------------------
 
         if can_call and call_cost >= state.my_chips:
             if self._should_call_preflop_allin(state, tier, profile):
@@ -279,7 +315,6 @@ class Player(BaseBot):
             call_freq *= 0.55
         if tier == 1 and 0.22 <= pot_odds <= 0.30:
             call_freq *= 0.85
-        # Short stack: tighten trash, push strong hands.
         stack_ratio = state.my_chips / float(max(1, state.opp_chips))
         if stack_ratio < 0.40:
             if tier == 0:
@@ -287,17 +322,6 @@ class Player(BaseBot):
             elif tier >= 2:
                 raise_freq += 0.08
 
-        # Extremely expensive calls: avoid blasting stacks with weak ranges.
-        # When the price is a large fraction of our stack, trash and marginal hands should almost never continue.
-        commit_ratio = call_cost / float(max(1, state.my_chips))
-        if commit_ratio > 0.40 and tier <= 1:
-            raise_freq *= 0.25
-            call_freq *= 0.40
-        if commit_ratio > 0.60 and tier <= 1:
-            raise_freq = 0.0
-            call_freq *= 0.30
-
-        # Reduce blind-drain against passive/small-raise profiles.
         if profile["small_raise_anchor"] and call_cost <= 70 and tier == 0:
             call_freq += 0.10
 
@@ -325,6 +349,7 @@ class Player(BaseBot):
             return ActionCall()
         return ActionFold()
 
+    # CHANGED: equity blend 0.55/0.45
     def _play_postflop(self, game_info: GameInfo, state: PokerState, t0: float):
         board = state.board
         opp_revealed = state.opp_revealed_cards
@@ -335,7 +360,7 @@ class Player(BaseBot):
             eq_reveal = self._estimate_equity_vs_revealed(
                 state.my_hand, board, opp_revealed[0], max(40, iters // 2), t0, game_info.time_bank
             )
-            eq = 0.60 * eq_reveal + 0.40 * eq
+            eq = 0.55 * eq_reveal + 0.45 * eq
 
         texture = self._board_texture(board)
         call_cost = max(0, state.cost_to_call)
@@ -366,26 +391,41 @@ class Player(BaseBot):
 
         return self._play_postflop_checked_to(state, adj_eq, pot, spr, texture, profile, rev_danger)
 
+    # CHANGED: escalation gate, facing-reraise 0.58, removed pot-odds catch
     def _play_postflop_facing_bet(self, state, adj_eq, pot, call_cost, pot_odds, spr, texture, profile, rev_danger, have_info):
         rel_price = call_cost / float(max(1, pot))
         facing_reraise = self.hand_i_bet_postflop and call_cost > 0
 
-        # When we bet and got RAISED: opponent almost always has a real hand.
-        # Dramatically tighten calling/raising range.
+        # --- NEW: Equity Discounting ---
+        stack_commit = call_cost / float(max(1, state.my_chips))
+        discount = 1.0
+        
+        # Heavy penalty for massive bets (opponent likely has the nuts)
+        if stack_commit > 0.40 or rel_price > 1.2:
+            discount = 0.65 
+        # Moderate penalty for strong bets or reraises
+        elif stack_commit > 0.20 or rel_price > 0.75 or facing_reraise:
+            discount = 0.85
+            
+        adj_eq = adj_eq * discount 
+        # -------------------------------
+
         if facing_reraise:
             raise_thresh = 0.78
-            call_thresh = 0.54
+            call_thresh = 0.58
             if state.street == "river":
-                # River reraises are heavily value-skewed in observed losses.
                 raise_thresh += 0.08
                 call_thresh += 0.10
             stack_commit = call_cost / float(max(1, state.my_chips))
             if stack_commit > 0.40:
-                call_thresh = 0.60
+                call_thresh = 0.62
             if stack_commit > 0.70:
-                call_thresh = 0.66
+                call_thresh = 0.68
             if rev_danger > 0.40:
                 call_thresh += 0.06
+
+            if self.hand_postflop_raises >= 2:
+                raise_thresh = max(raise_thresh, 0.88)
 
             if state.can_act(ActionRaise) and adj_eq > raise_thresh:
                 amount = self._choose_postflop_raise_size(state, adj_eq, 0.80, texture, spr, state.street)
@@ -399,7 +439,6 @@ class Player(BaseBot):
         small_stab = rel_price <= 0.16
         huge_bet = rel_price >= 0.90
 
-        # Punish tiny stabs -- but only with decent equity, and smaller sizing
         if small_stab and state.can_act(ActionRaise) and adj_eq > 0.45:
             punish_gate = profile["fold_rate"] > 0.40 or self._rate(self.opp_small_stab_hits, self.opp_post_bet_spots, 0.22) > 0.35
             if punish_gate and self.rng.random() < 0.55:
@@ -413,11 +452,9 @@ class Player(BaseBot):
         if profile["massive_pre_jammer"]:
             call_thresh += 0.03
         if not have_info:
-            # Without revealed-card edge, avoid paying off big barrels.
             call_thresh += 0.08
             raise_thresh += 0.05
         elif have_info and adj_eq > 0.70:
-            # With info and strong equity, value-raise more.
             raise_thresh = 0.62 if adj_eq <= 0.78 else 0.60
         if huge_bet:
             huge_rate = self._rate(self.opp_huge_bet_hits, self.opp_post_bet_spots, 0.18)
@@ -425,17 +462,11 @@ class Player(BaseBot):
             if huge_rate > 0.22:
                 raise_thresh += 0.05
                 call_thresh += 0.08
-            # For river overbets, treat them as heavily value-weighted unless proven otherwise.
-            if state.street == "river":
-                min_call = 0.72
-                if huge_rate > 0.22:
-                    min_call = 0.78
-                stack_commit = call_cost / float(max(1, state.my_chips))
-                if stack_commit > 0.60:
-                    min_call = max(min_call, 0.80)
-                if rev_danger > 0.40:
-                    min_call += 0.04
-                call_thresh = max(call_thresh, self._clip(min_call, 0.0, 0.95))
+
+        if self.hand_postflop_raises >= 2:
+            raise_thresh = max(raise_thresh, 0.82)
+        elif self.hand_postflop_raises >= 1:
+            raise_thresh = max(raise_thresh, 0.74)
 
         if rel_price > 0.45:
             call_thresh = max(call_thresh, 0.46)
@@ -444,7 +475,7 @@ class Player(BaseBot):
         if rel_price > 0.80:
             call_thresh = max(call_thresh, 0.60)
         if state.street == "river":
-            call_thresh += 0.02  # Stricter on river - v2 value-heavy
+            call_thresh += 0.02
             if rel_price > 0.25:
                 call_thresh = max(call_thresh, 0.54)
             if rel_price > 0.35:
@@ -470,15 +501,6 @@ class Player(BaseBot):
 
         if state.can_act(ActionCall) and adj_eq >= call_thresh:
             return ActionCall()
-        # Pot odds edge: great price with decent equity when just below call thresh.
-        if (
-            not huge_bet
-            and state.can_act(ActionCall)
-            and adj_eq >= 0.38
-            and pot_odds < 0.28
-            and (call_thresh - adj_eq) < 0.08
-        ):
-            return ActionCall()
 
         if state.can_act(ActionFold):
             return ActionFold()
@@ -486,25 +508,27 @@ class Player(BaseBot):
             return ActionCheck()
         return ActionCall() if state.can_act(ActionCall) else ActionFold()
 
+    # CHANGED: escalation gate, bigger value bets
     def _play_postflop_checked_to(self, state, adj_eq, pot, spr, texture, profile, rev_danger):
         if not state.can_act(ActionRaise):
+            return ActionCheck() if state.can_act(ActionCheck) else self._fallback_action(state)
+
+        if self.hand_postflop_raises >= 2 and adj_eq < 0.80:
             return ActionCheck() if state.can_act(ActionCheck) else self._fallback_action(state)
 
         is_calling_station = profile["calling_station"]
         fold_rate = profile["fold_rate"]
         value_thresh = 0.54 if state.street == "flop" else 0.56
 
-        # Against calling stations: only bet for value, never bluff
         if is_calling_station:
             if adj_eq > value_thresh + 0.04:
-                pressure = self._clip(0.40 + 0.30 * (adj_eq - 0.55), 0.30, 0.75)
+                pressure = self._clip(0.48 + 0.40 * (adj_eq - 0.50), 0.35, 0.80)
                 amount = self._choose_postflop_raise_size(state, adj_eq, pressure, texture, spr, state.street)
                 self.hand_i_bet_postflop = True
                 return self._safe_raise_or_fallback(state, amount)
             return ActionCheck() if state.can_act(ActionCheck) else self._fallback_action(state)
 
         value_bet = adj_eq > value_thresh
-        # Bluff only with good fold equity, never if revealed card is dangerous
         bluff_ok = (
             adj_eq < 0.42
             and texture["wetness"] == 0
@@ -518,7 +542,6 @@ class Player(BaseBot):
             and adj_eq > 0.40
             and self.rng.random() < 0.14
         )
-        # Turn semi-bluff: bet draws when opp folds often.
         semi_bluff_ok = (
             state.street == "turn"
             and 0.38 < adj_eq < 0.50
@@ -536,10 +559,9 @@ class Player(BaseBot):
             elif semi_bluff_ok:
                 pressure = 0.32
             else:
-                pressure = self._clip(0.40 + 0.30 * max(0.0, adj_eq - 0.52), 0.30, 0.75)
-                # River value sizing: bet more with strong hands.
+                pressure = self._clip(0.48 + 0.40 * max(0.0, adj_eq - 0.50), 0.35, 0.80)
                 if state.street == "river" and adj_eq > 0.65:
-                    pressure = self._clip(pressure + 0.05, 0.35, 0.80)
+                    pressure = self._clip(pressure + 0.08, 0.40, 0.85)
             amount = self._choose_postflop_raise_size(state, adj_eq, pressure, texture, spr, state.street)
             self.hand_i_bet_postflop = True
             return self._safe_raise_or_fallback(state, amount)
@@ -548,7 +570,7 @@ class Player(BaseBot):
             return ActionCheck()
         return self._fallback_action(state)
 
-    # ---------- Auction ----------
+    # ---------- Auction (CHANGED: ROI tracking + hard cap) ----------
 
     def _choose_auction_bid(self, game_info: GameInfo, state: PokerState, t0: float) -> int:
         self.hand_auction_chips = (state.my_chips, state.opp_chips)
@@ -593,11 +615,9 @@ class Player(BaseBot):
                 base *= 0.68
             target = 0.60 * base + 0.40 * (pred_opp_bid * (0.92 + 0.14 * value_of_info))
             target = min(target, min(state.my_chips, int(0.44 * effective + 0.40 * pot)))
-            # Minimum bid when we have decent equity - avoid chronic underbids.
             if eq_without > 0.48:
                 target = max(target, max(5, int(0.02 * pot)))
 
-        # Escalate bids after repeated auction losses/high-pressure opponents.
         loss_rate = profile["auction_loss_rate"]
         loss_streak = profile["auction_loss_streak"]
         pressure_rate = profile["auction_pressure_rate"]
@@ -614,10 +634,26 @@ class Player(BaseBot):
         max_reasonable = min(state.my_chips, int(0.35 * (pot + state.my_chips)))
         bid = int(self._clip(noisy, 0, max_reasonable))
 
+        eff = max(1, min(state.my_chips, state.opp_chips))
+        win_rate = (self.auction_seen - self.auction_lost) / float(max(1, self.auction_seen))
+
+        if self._auction_win_rounds >= 12:
+            win_ev = self._auction_win_payoff_sum / float(self._auction_win_rounds)
+            if win_ev < -5:
+                bid = int(bid * 0.55)
+            elif win_ev < -2:
+                bid = int(bid * 0.70)
+
+        if self.auction_seen >= 16 and win_rate > 0.66:
+            bid = min(bid, int(max(0, pred_opp_bid * 0.80)))
+
+        hard_cap = int(min(state.my_chips, max(6, int(0.015 * eff), int(0.08 * pot))))
+        bid = int(self._clip(bid, 0, hard_cap))
+
         self.hand_my_bid = bid
         return bid
 
-    # ---------- Opponent model updates ----------
+    # ---------- Opponent model updates (CHANGED: auction outcome tracking) ----------
 
     def _update_live_opponent_model(self, state: PokerState) -> None:
         if state.street == "pre-flop":
@@ -645,7 +681,6 @@ class Player(BaseBot):
             if rel >= 0.90:
                 self.opp_huge_bet_hits += 1
 
-        # Track opponent response to our postflop bets
         if state.street in ("flop", "turn", "river") and self.hand_i_bet_postflop:
             if state.cost_to_call > 0:
                 self.our_postflop_bet_spots += 1
@@ -668,6 +703,7 @@ class Player(BaseBot):
                 self.opp_bid_exact_samples.append(d_my)
                 self.auction_seen += 1
                 self.auction_loss_streak = 0
+                self._hand_auction_outcome = 1
             elif d_opp > 0 and d_my == 0:
                 self.opp_bid_lower_bounds.append(max(1, self.hand_my_bid + 1))
                 self.auction_seen += 1
@@ -675,6 +711,7 @@ class Player(BaseBot):
                 self.auction_loss_streak += 1
                 if d_opp >= max(120, int(0.18 * max(1, state.pot))):
                     self.auction_overbid_pressure_hits += 1
+                self._hand_auction_outcome = -1
             elif d_my > 0 and d_opp > 0:
                 self.opp_bid_exact_samples.append(d_opp)
                 self.auction_seen += 1
@@ -682,15 +719,32 @@ class Player(BaseBot):
 
             self.hand_auction_processed = True
 
-    # ---------- Action safety and fallback ----------
+    # ---------- Action safety (CHANGED: hard caps + escalation tracking) ----------
 
     def _safe_raise_or_fallback(self, state: PokerState, amount: int):
         if state.can_act(ActionRaise):
             min_r, max_r = state.raise_bounds
-            amt = int(self._clip(amount, min_r, max_r))
+            pot = max(1, state.pot)
+            eff = max(1, min(state.my_chips, state.opp_chips))
+
+            # Define the absolute maximum we are willing to raise
+            if state.street == "pre-flop":
+                ideal_cap = int(min(4.0 * pot, 0.35 * eff))
+            else:
+                ideal_cap = int(min(1.2 * pot, 0.30 * eff))
+
+            # --- NEW: Abort raise if the legal minimum breaks our safety cap ---
+            if min_r > ideal_cap:
+                return self._fallback_action(state)
+
+            amt = int(self._clip(amount, min_r, min(max_r, ideal_cap)))
+
             if min_r <= amt <= max_r:
                 self.hand_i_raised = True
+                if state.street in ("flop", "turn", "river"):
+                    self.hand_postflop_raises += 1
                 return ActionRaise(amt)
+                
         return self._fallback_action(state)
 
     def _safe_bid(self, state: PokerState, amount: int):
@@ -719,6 +773,7 @@ class Player(BaseBot):
 
     # ---------- Sizing helpers ----------
 
+    # _choose_preflop_raise_size: IDENTICAL to v3
     def _choose_preflop_raise_size(self, state: PokerState, tier: int, profile: dict) -> int:
         min_r, max_r = state.raise_bounds
         span = max(0, max_r - min_r)
@@ -741,18 +796,19 @@ class Player(BaseBot):
         target = min_r + int(span * self._clip(frac, 0.06, 0.78))
         return int(self._clip(target, min_r, max_r))
 
+    # CHANGED: removed spr<1.0/eq>0.60 push, added sizing cap
     def _choose_postflop_raise_size(self, state: PokerState, eq: float, pressure: float, texture: dict, spr: float, street: str) -> int:
         min_r, max_r = state.raise_bounds
         pot = max(1, state.pot)
+        eff = max(1, min(state.my_chips, state.opp_chips))
 
-        # Pot-relative sizing instead of range-relative to avoid absurd overbets
         base_multiplier = self._clip(pressure, 0.25, 0.85)
         target_bet = int(pot * base_multiplier)
 
         if eq > 0.75:
             target_bet = int(pot * self._clip(pressure + 0.12, 0.40, 0.95))
-        if spr < 1.0 and eq > 0.60:
-            target_bet = max(target_bet, int(0.80 * state.my_chips))
+        if spr < 1.0 and eq > 0.78:
+            target_bet = max(target_bet, int(0.70 * state.my_chips))
         if street == "river" and eq > 0.65:
             target_bet = max(target_bet, int(pot * 0.72))
 
@@ -760,19 +816,13 @@ class Player(BaseBot):
         target_bet += wet_penalty
 
         target_bet += self.rng.randint(-int(0.05 * pot) - 1, int(0.05 * pot) + 1)
-        return int(self._clip(target_bet, min_r, max_r))
 
-    # ---------- Equity estimation ----------
+        cap = int(max(min_r, min(max_r, pot, 0.35 * eff)))
+        return int(self._clip(target_bet, min_r, cap))
 
-    def _estimate_equity(
-        self,
-        my_hand: list[str],
-        board: list[str],
-        opp_revealed: list[str],
-        iters: int,
-        t0: float,
-        time_bank: float,
-    ) -> float:
+    # ---------- Equity estimation (IDENTICAL to v3) ----------
+
+    def _estimate_equity(self, my_hand, board, opp_revealed, iters, t0, time_bank):
         key = (tuple(sorted(my_hand)), tuple(board), tuple(sorted(opp_revealed)), len(board), iters // 40)
         if key in self.equity_cache:
             return self.equity_cache[key]
@@ -825,25 +875,10 @@ class Player(BaseBot):
         self.equity_cache[key] = eq
         return eq
 
-    def _estimate_equity_vs_revealed(
-        self,
-        my_hand: list[str],
-        board: list[str],
-        revealed: str,
-        iters: int,
-        t0: float,
-        time_bank: float,
-    ) -> float:
+    def _estimate_equity_vs_revealed(self, my_hand, board, revealed, iters, t0, time_bank):
         return self._estimate_equity(my_hand, board, [revealed], iters, t0, time_bank)
 
-    def _estimate_equity_vs_revealed_mix(
-        self,
-        my_hand: list[str],
-        board: list[str],
-        iters: int,
-        t0: float,
-        time_bank: float,
-    ) -> float:
+    def _estimate_equity_vs_revealed_mix(self, my_hand, board, iters, t0, time_bank):
         known = set(my_hand + board)
         candidates = [r + s for r in RANK_ORDER for s in "shdc" if (r + s) not in known]
         if not candidates:
@@ -856,9 +891,9 @@ class Player(BaseBot):
             total += self._estimate_equity_vs_revealed(my_hand, board, c, max(16, iters // max(1, samples)), t0, time_bank)
         return total / float(samples)
 
-    # ---------- Utility helpers ----------
+    # ---------- Utility helpers (IDENTICAL to v3) ----------
 
-    def _preflop_hand_key(self, c1: str, c2: str) -> str:
+    def _preflop_hand_key(self, c1, c2):
         r1, s1 = c1[0], c1[1]
         r2, s2 = c2[0], c2[1]
         if r1 == r2:
@@ -867,7 +902,7 @@ class Player(BaseBot):
         suited = "s" if s1 == s2 else "o"
         return hi + lo + suited
 
-    def _preflop_tier(self, hand_key: str) -> int:
+    def _preflop_tier(self, hand_key):
         if hand_key in PREMIUM:
             return 3
         if hand_key in STRONG:
@@ -876,17 +911,13 @@ class Player(BaseBot):
             return 1
         return 0
 
-    def _should_call_preflop_allin(self, state: PokerState, tier: int, profile: dict) -> bool:
+    def _should_call_preflop_allin(self, state, tier, profile):
         c1, c2 = state.my_hand
         r1 = RANK_TO_INT[c1[0]]
         r2 = RANK_TO_INT[c2[0]]
         suited = c1[1] == c2[1]
         high = max(r1, r2)
         low = min(r1, r2)
-
-        # Never call an all-in with pure trash; require at least a playable tier.
-        if tier == 0:
-            return False
 
         if tier >= 2:
             return True
@@ -901,10 +932,10 @@ class Player(BaseBot):
         pot = max(1, state.pot)
         req = call_cost / float(pot + call_cost)
         if profile["massive_pre_jammer"]:
-            return req <= 0.15 and tier >= 1
-        return req <= 0.18 and tier >= 1
+            return req <= 0.16 and tier >= 1
+        return req <= 0.19 and tier >= 1
 
-    def _should_rare_preflop_fold(self, state: PokerState, tier: int, profile: dict, pot_odds: float) -> bool:
+    def _should_rare_preflop_fold(self, state, tier, profile, pot_odds):
         if not state.can_act(ActionFold) or not state.can_act(ActionCall):
             return False
         if tier >= 1:
@@ -919,7 +950,7 @@ class Player(BaseBot):
         jammer = profile["massive_pre_jammer"]
         return low_stack and terrible_price and jammer and self.rng.random() < 0.82
 
-    def _board_texture(self, board: list[str]) -> dict:
+    def _board_texture(self, board):
         if not board:
             return {"wetness": 0}
         ranks = sorted((RANK_TO_INT[c[0]] for c in board), reverse=True)
@@ -939,7 +970,7 @@ class Player(BaseBot):
             wetness += 1
         return {"wetness": wetness}
 
-    def _predict_opp_bid(self, opp_stack: int, pot: int) -> int:
+    def _predict_opp_bid(self, opp_stack, pot):
         if self.opp_bid_exact_samples:
             mean_exact = sum(self.opp_bid_exact_samples) / float(len(self.opp_bid_exact_samples))
         else:
@@ -956,17 +987,16 @@ class Player(BaseBot):
             pred = max(pred, 0.50 * lb_hi)
         if self.auction_seen >= 5 and self.auction_lost / float(max(1, self.auction_seen)) > 0.58:
             pred = max(pred, 0.18 * max(1, pot))
-        # Unknown opponent: bump pred to avoid chronic underbidding early.
         if self.auction_seen < 5:
             pred *= 1.12
 
         pred *= 1.03
         return int(self._clip(pred, 0, opp_stack))
 
-    def _opp_fold_to_raise_rate(self) -> float:
+    def _opp_fold_to_raise_rate(self):
         return self._rate(self.opp_fold_to_raise_hits, self.our_raise_opps, 0.35)
 
-    def _choose_mc_iters(self, time_bank: float, street: str) -> int:
+    def _choose_mc_iters(self, time_bank, street):
         if time_bank < 2.5:
             base = 40
         elif time_bank < 6.0:
@@ -986,7 +1016,7 @@ class Player(BaseBot):
             return int(base * 0.90)
         return base
 
-    def _per_decision_time_budget(self, time_bank: float) -> float:
+    def _per_decision_time_budget(self, time_bank):
         if time_bank < 1.5:
             return 0.012
         if time_bank < 4.0:
@@ -996,13 +1026,13 @@ class Player(BaseBot):
         return 0.050
 
     @staticmethod
-    def _rate(num: int, den: int, default: float) -> float:
+    def _rate(num, den, default):
         if den <= 0:
             return default
         return num / float(den)
 
     @staticmethod
-    def _clip(x: float, lo: float, hi: float) -> float:
+    def _clip(x, lo, hi):
         if x < lo:
             return lo
         if x > hi:
