@@ -4,8 +4,8 @@ PYTHON_CMD = ".venv312/bin/python"
 BOT_1_NAME = 'v5'
 BOT_1_FILE = './botharshu_v5.py'
 
-BOT_2_NAME = 'CurrentActiveBot'
-BOT_2_FILE = './CurrentActiveBot.py'
+BOT_2_NAME = 'CurrentActiveBot_V3'
+BOT_2_FILE = './CurrentActiveBot_V3.py'
 
 # GAME PROGRESS IS RECORDED HERE
 GAME_LOG_FOLDER = './logs'

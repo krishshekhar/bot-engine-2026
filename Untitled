@@ -215,7 +215,7 @@ class Player(BaseBot):
         pot = max(1, state.pot)
         pot_odds = call_cost / float(pot + call_cost) if call_cost > 0 else 0.0
 
-        # Hard trash tier behaviour: never pay chips pre-flop with trash hands.
+        # Hard trash-tier behaviour: never pay chips pre-flop with trash hands.
         # If our hand is not in PREMIUM/STRONG/PLAYABLE (tier == 0), always fold
         # when facing a cost to continue; if we can see a free flop, just check.
         if tier == 0:
@@ -404,6 +404,25 @@ class Player(BaseBot):
                 call_thresh = 0.68
             if rev_danger > 0.40:
                 call_thresh += 0.06
+            # Be significantly more conservative in turn/river raise wars when we have
+            # already raised once and villain now re-raises. This targets spots where
+            # we only hold a marginal one-pair / air hand but face heavy aggression.
+            if state.street in ("turn", "river"):
+                if self.hand_postflop_raises >= 1:
+                    # Require stronger equity to continue once we've escalated the pot.
+                    call_thresh += 0.05
+                    raise_thresh = max(raise_thresh, 0.84)
+                # Large re-raises relative to the pot are treated as value-heavy.
+                if rel_price > 0.40:
+                    call_thresh += 0.05
+                # Passive opponents who rarely raise postflop are unlikely to bluff-3bet.
+                opp_raise_rate = profile.get("opp_raise_rate", 0.10)
+                if opp_raise_rate < 0.12:
+                    call_thresh += 0.03
+                # Opponents who frequently use huge bet sizes are also weighted toward value.
+                huge_rate = self._rate(self.opp_huge_bet_hits, self.opp_post_bet_spots, 0.18)
+                if huge_rate > 0.22:
+                    call_thresh += 0.03
 
             if self.hand_postflop_raises >= 2:
                 raise_thresh = max(raise_thresh, 0.88)
