@@ -73,6 +73,10 @@ class Player(BaseBot):
         self._auction_loss_rounds = 0
         self._auction_loss_payoff_sum = 0
 
+        # Adaptive preflop aggression tracking
+        self.preflop_aggr_score = 0
+        self.hand_used_high_preflop = False
+
         self.equity_cache = {}
 
     def on_hand_start(self, game_info: GameInfo, current_state: PokerState) -> None:
@@ -86,6 +90,7 @@ class Player(BaseBot):
         self.hand_auction_processed = False
         self.hand_postflop_raises = 0
         self._hand_auction_outcome = 0
+        self.hand_used_high_preflop = False
 
     def on_hand_end(self, game_info: GameInfo, current_state: PokerState) -> None:
         if self.hand_i_raised:
@@ -99,6 +104,17 @@ class Player(BaseBot):
         elif self._hand_auction_outcome < 0:
             self._auction_loss_rounds += 1
             self._auction_loss_payoff_sum += current_state.payoff
+
+        # Update adaptive preflop aggression score based on how high preflop
+        # aggression performed in this hand. Success is +1, failure is -2.
+        if self.hand_used_high_preflop:
+            if current_state.payoff > 0:
+                self.preflop_aggr_score += 1
+            elif current_state.payoff < 0:
+                self.preflop_aggr_score -= 2
+            # Keep the score in a modest range so it nudges behaviour
+            # without completely overriding the base strategy.
+            self.preflop_aggr_score = int(self._clip(self.preflop_aggr_score, -6, 6))
 
     def get_move(
         self,
@@ -316,9 +332,15 @@ class Player(BaseBot):
         roll = self.rng.random()
         if can_raise and roll < raise_freq:
             amount = self._choose_preflop_raise_size(state, tier, profile)
+            # Mark this hand as having used "high" preflop aggression if we
+            # commit more than a league-sensitive threshold preflop.
+            if amount > 200:
+                self.hand_used_high_preflop = True
             return self._safe_raise_or_fallback(state, amount)
 
         if can_call and roll < raise_freq + call_freq:
+            if call_cost > 200:
+                self.hand_used_high_preflop = True
             return ActionCall()
 
         if self._should_rare_preflop_fold(state, tier, profile, pot_odds):
@@ -875,7 +897,6 @@ class Player(BaseBot):
 
     # ---------- Sizing helpers ----------
 
-    # _choose_preflop_raise_size: IDENTICAL to v3
     def _choose_preflop_raise_size(self, state: PokerState, tier: int, profile: dict) -> int:
         min_r, max_r = state.raise_bounds
         span = max(0, max_r - min_r)
@@ -894,6 +915,14 @@ class Player(BaseBot):
             frac -= 0.12
         if fold_rate > 0.44:
             frac += 0.08
+
+        # Adaptive preflop aggression: if recent high-preflop aggression has
+        # been profitable, slightly increase sizing; if it has been punished,
+        # reduce sizing. Each point of preflop_aggr_score moves the target
+        # fraction by about 3 percentage points before clipping.
+        if self.preflop_aggr_score != 0:
+            frac += 0.03 * self.preflop_aggr_score
+
         frac += self.rng.uniform(-0.06, 0.06)
         target = min_r + int(span * self._clip(frac, 0.06, 0.78))
         return int(self._clip(target, min_r, max_r))
